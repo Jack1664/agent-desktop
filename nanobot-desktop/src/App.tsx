@@ -94,6 +94,7 @@ type SessionMessagePayload = {
 };
 
 const SESSION_ID = "gui:default";
+const KNOWLEDGE_SESSION_ID = "gui:knowledge";
 const MAX_INPUT_LINES = 6;
 const HISTORY_BATCH = 10;
 
@@ -357,6 +358,18 @@ export default function App() {
   const [knowledgeError, setKnowledgeError] = useState("");
   const [knowledgePicking, setKnowledgePicking] = useState(false);
   const [knowledgePath, setKnowledgePath] = useState("");
+  const [knowledgeChatOpen, setKnowledgeChatOpen] = useState(false);
+  const [knowledgeChatMessages, setKnowledgeChatMessages] = useState<Message[]>([
+    {
+      id: "knowledge-chat-welcome",
+      role: "system",
+      content: "这里是知识库对话流。后续可以在这里接入基于当前目录内容的问答。",
+      createdAt: now()
+    }
+  ]);
+  const [knowledgeChatInput, setKnowledgeChatInput] = useState("");
+  const [knowledgeChatSending, setKnowledgeChatSending] = useState(false);
+  const knowledgeChatListRef = useRef<HTMLDivElement | null>(null);
   const configFileInputRef = useRef<HTMLInputElement | null>(null);
   const newSkillInputRef = useRef<HTMLInputElement | null>(null);
   const pendingLogsRef = useRef<LogState>({ agent: [], gateway: [] });
@@ -578,6 +591,14 @@ export default function App() {
       node.scrollTop = node.scrollHeight;
     }
   }, [messages, tab]);
+
+  useEffect(() => {
+    if (tab !== "knowledge" || !knowledgeChatOpen) return;
+    const node = knowledgeChatListRef.current;
+    if (node) {
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [tab, knowledgeChatOpen, knowledgeChatMessages]);
 
   useEffect(() => {
     if (tab !== "monitor") return;
@@ -1099,6 +1120,67 @@ export default function App() {
   const knowledgeCrumbs = knowledgeBase.currentRelativePath
     ? knowledgeBase.currentRelativePath.split(/[\\/]/).filter(Boolean)
     : [];
+
+  const sendKnowledgeChatMessage = async () => {
+    const text = knowledgeChatInput.trim();
+    if (!text || knowledgeChatSending) return;
+    const userMsg: Message = {
+      id: `knowledge-user-${Date.now()}`,
+      role: "user",
+      content: text,
+      createdAt: now()
+    };
+    setKnowledgeChatInput("");
+    setKnowledgeChatMessages((prev) => [...prev, userMsg]);
+    setKnowledgeChatSending(true);
+    try {
+      const visibleItems = knowledgeBase.files
+        .slice(0, 30)
+        .map((file) => `- [${file.isDir ? "dir" : "file"}] ${file.relativePath}`)
+        .join("\n");
+      const prompt = [
+        "You are answering inside the Knowledge Base panel of the Nanobot desktop app.",
+        `Knowledge base root: ${knowledgeBase.directory || "(not configured)"}`,
+        `Current relative path: ${knowledgeBase.currentRelativePath || "/"}`,
+        "Visible entries in the current folder:",
+        visibleItems || "(empty)",
+        "",
+        "Please answer the user's question with this directory context in mind.",
+        `User question: ${text}`
+      ].join("\n");
+      const response = await invoke<string>("send_agent_message", {
+        message: prompt,
+        sessionId: KNOWLEDGE_SESSION_ID
+      });
+      const botMsg: Message = {
+        id: `knowledge-bot-${Date.now()}`,
+        role: "bot",
+        content: response.trim() || "(no response)",
+        createdAt: now()
+      };
+      setKnowledgeChatMessages((prev) => [...prev, botMsg]);
+    } catch (err) {
+      const botMsg: Message = {
+        id: `knowledge-err-${Date.now()}`,
+        role: "system",
+        content: `Error: ${String(err)}`,
+        createdAt: now()
+      };
+      setKnowledgeChatMessages((prev) => [...prev, botMsg]);
+    } finally {
+      setKnowledgeChatSending(false);
+    }
+  };
+
+  const handleKnowledgeChatKeyDown = (event: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if (event.nativeEvent.isComposing) {
+      return;
+    }
+    if (event.key === "Enter" && !event.shiftKey) {
+      event.preventDefault();
+      sendKnowledgeChatMessage();
+    }
+  };
   const openMemory = async (name: string) => {
     try {
       const payload = await invoke<MemoryFilePayload>("read_memory_file", { name });
@@ -1938,6 +2020,12 @@ export default function App() {
                 Knowledge files: {knowledgeBase.files.length}
               </div>
               <div className="memory-actions">
+                <button
+                  className={knowledgeChatOpen ? "ghost" : ""}
+                  onClick={() => setKnowledgeChatOpen((prev) => !prev)}
+                >
+                  {knowledgeChatOpen ? "Hide Chat" : "Open Chat"}
+                </button>
                 <button onClick={() => void pickKnowledgeBaseDir()} disabled={knowledgePicking}>
                   {knowledgeBase.configured ? "Change Directory" : "Choose Directory"}
                 </button>
@@ -1960,7 +2048,7 @@ export default function App() {
                 </div>
               </div>
             ) : (
-              <div className="memory-layout">
+              <div className={`memory-layout knowledge-layout ${knowledgeChatOpen ? "chat-open" : ""}`}>
                 <div className="memory-list">
                   <div className="skill-card">
                     <div className="skill-title">当前目录</div>
@@ -2033,33 +2121,112 @@ export default function App() {
                     </div>
                   ))}
                 </div>
-                <div className="memory-editor">
-                  <div className="editor-header">
-                    <div className="editor-title">知识库说明</div>
-                    <div className="editor-actions">
-                      <button className="ghost" onClick={() => void pickKnowledgeBaseDir()} disabled={knowledgePicking}>
-                        更换目录
+                {knowledgeChatOpen ? (
+                  <div className="memory-editor knowledge-chat-panel">
+                    <div className="editor-header">
+                      <div className="editor-title">知识库对话流</div>
+                      <div className="editor-actions">
+                        <button className="ghost" onClick={() => setKnowledgeChatOpen(false)}>
+                          收起
+                        </button>
+                      </div>
+                    </div>
+                    <div className="chat-list knowledge-chat-list" ref={knowledgeChatListRef}>
+                      {knowledgeChatMessages.map((msg) => (
+                        <div
+                          key={msg.id}
+                          className={`message-row ${msg.role === "user" ? "user" : "bot"}`}
+                        >
+                          <div className={`bubble ${msg.role === "user" ? "user" : "bot"}`}>
+                            <div className="content">
+                              {msg.role === "bot" ? (() => {
+                                const {
+                                  main,
+                                  debug,
+                                  debugCount,
+                                  tools,
+                                  toolCount,
+                                  subagents,
+                                  subagentCount
+                                } = splitDebugContent(msg.content);
+                                return (
+                                  <>
+                                    {main ? (
+                                      <ReactMarkdown remarkPlugins={[remarkGfm]}>{main}</ReactMarkdown>
+                                    ) : null}
+                                    {tools ? (
+                                      <details className="debug-details">
+                                        <summary>调用工具（{toolCount}）</summary>
+                                        <pre>{cleanLogBlock(tools)}</pre>
+                                      </details>
+                                    ) : null}
+                                    {subagents ? (
+                                      <details className="debug-details">
+                                        <summary>子代理（{subagentCount}）</summary>
+                                        <pre>{cleanLogBlock(subagents)}</pre>
+                                      </details>
+                                    ) : null}
+                                    {debug ? (
+                                      <details className="debug-details">
+                                        <summary>调试日志（{debugCount}）</summary>
+                                        <pre>{cleanLogBlock(debug)}</pre>
+                                      </details>
+                                    ) : null}
+                                  </>
+                                );
+                              })() : (
+                                <div style={{ whiteSpace: "pre-wrap" }}>{msg.content}</div>
+                              )}
+                            </div>
+                          </div>
+                          <div className="bubble-meta">
+                            {msg.role} · {msg.createdAt}
+                          </div>
+                        </div>
+                      ))}
+                    </div>
+                    <div className="knowledge-chat-input">
+                      <textarea
+                        rows={3}
+                        value={knowledgeChatInput}
+                        onChange={(e) => setKnowledgeChatInput(e.target.value)}
+                        onKeyDown={handleKnowledgeChatKeyDown}
+                        placeholder="输入你想基于知识库提问的内容..."
+                      />
+                      <button onClick={sendKnowledgeChatMessage} disabled={knowledgeChatSending}>
+                        {knowledgeChatSending ? "发送中..." : "发送"}
                       </button>
                     </div>
                   </div>
-                  <div className="knowledge-summary">
-                    <div className="knowledge-stat">
-                      <span>已授权目录</span>
-                      <strong>{knowledgeBase.directory}</strong>
+                ) : (
+                  <div className="memory-editor">
+                    <div className="editor-header">
+                      <div className="editor-title">知识库说明</div>
+                      <div className="editor-actions">
+                        <button className="ghost" onClick={() => void pickKnowledgeBaseDir()} disabled={knowledgePicking}>
+                          更换目录
+                        </button>
+                      </div>
                     </div>
-                    <div className="knowledge-stat">
-                      <span>条目数量</span>
-                      <strong>{knowledgeBase.files.length}</strong>
-                    </div>
-                    <div className="knowledge-stat">
-                      <span>当前子路径</span>
-                      <strong>{knowledgeBase.currentRelativePath || "/"}</strong>
-                    </div>
-                    <div className="editor-hint">
-                      点击目录名称可以继续进入子目录浏览。后续如果你要，我可以继续补充文件预览、新建、删除和重命名能力。
+                    <div className="knowledge-summary">
+                      <div className="knowledge-stat">
+                        <span>已授权目录</span>
+                        <strong>{knowledgeBase.directory}</strong>
+                      </div>
+                      <div className="knowledge-stat">
+                        <span>条目数量</span>
+                        <strong>{knowledgeBase.files.length}</strong>
+                      </div>
+                      <div className="knowledge-stat">
+                        <span>当前子路径</span>
+                        <strong>{knowledgeBase.currentRelativePath || "/"}</strong>
+                      </div>
+                      <div className="editor-hint">
+                        点击目录名称可以继续进入子目录浏览。后续如果你要，我可以继续补充文件预览、新建、删除和重命名能力。
+                      </div>
                     </div>
                   </div>
-                </div>
+                )}
               </div>
             )}
           </div>
