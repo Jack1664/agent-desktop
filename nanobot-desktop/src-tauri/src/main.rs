@@ -113,7 +113,6 @@ fn repo_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("..")
         .join("..")
-        .join("..")
 }
 
 fn normalize_path(path: &Path) -> PathBuf {
@@ -292,6 +291,39 @@ fn local_venv_python() -> Option<PathBuf> {
     None
 }
 
+fn python_supports_nanobot(python: &Path) -> bool {
+    let root = repo_root();
+    let script = "import typer; import nanobot.cli.commands";
+    Command::new(python)
+        .arg("-c")
+        .arg(script)
+        .current_dir(root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
+}
+
+fn find_in_path(bin: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let candidate = dir.join(bin);
+        if candidate.exists() {
+            return Some(candidate);
+        }
+    }
+    None
+}
+
+fn default_python_command() -> &'static str {
+    if find_in_path("python3").is_some() {
+        "python3"
+    } else {
+        "python"
+    }
+}
+
 fn build_pythonpath(app: &AppHandle, use_embedded: bool) -> Option<String> {
     let mut paths: Vec<PathBuf> = Vec::new();
     if let Some(site) = embedded_site_packages(app) {
@@ -314,15 +346,19 @@ fn build_pythonpath(app: &AppHandle, use_embedded: bool) -> Option<String> {
 
 fn base_command(app: &AppHandle) -> Command {
     let embedded_python = embedded_python_exe(app);
-    let venv_python = local_venv_python();
+    let venv_python = local_venv_python().filter(|py| python_supports_nanobot(py));
     let use_embedded = embedded_python.is_some();
-    let python = embedded_python
-        .or(venv_python)
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_else(|| "python".to_string());
+    let launcher = if let Some(py) = embedded_python.or(venv_python) {
+        ("python".to_string(), py.to_string_lossy().to_string())
+    } else {
+        ("python".to_string(), default_python_command().to_string())
+    };
     let python_path = build_pythonpath(app, use_embedded);
     if *PRINT_LOGS.get_or_init(|| std::env::var_os("NANOBOT_TAURI_LOG_STDOUT").is_some()) {
-        println!("[nanobot-desktop] python={python}");
+        println!(
+            "[nanobot-desktop] launcher={} path={}",
+            launcher.0, launcher.1
+        );
         if let Some(root) = embedded_python_root(app) {
             println!("[nanobot-desktop] embedded_python_root={}", root.display());
         }
@@ -333,7 +369,7 @@ fn base_command(app: &AppHandle) -> Command {
             println!("[nanobot-desktop] PYTHONPATH={path}");
         }
     }
-    let mut cmd = Command::new(python);
+    let mut cmd = Command::new(&launcher.1);
     let root = repo_root();
     if root.exists() {
         cmd.current_dir(&root);
@@ -394,7 +430,8 @@ fn run_onboard_inner(app: &AppHandle) -> Result<(), String> {
         "stdout",
     );
     let mut cmd = base_command(app);
-    cmd.args(["-m", "nanobot", "onboard"]);
+    let entry = repo_root().join("nanobot").join("__main__.py");
+    cmd.arg(entry).arg("onboard");
     match cmd.status() {
         Ok(status) if status.success() => {
             emit_log(app, "gateway", "Onboard completed".to_string(), "stdout");
@@ -669,10 +706,13 @@ fn start_process_inner(
     match kind {
         "agent" => {
             let mut cmd = base_command(app);
-            cmd.args(["-u", "-m", "nanobot", "agent", "--daemon"])
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .stdin(Stdio::piped());
+            let entry = repo_root().join("nanobot").join("__main__.py");
+            cmd.arg("-u")
+                .arg(entry)
+                .args(["agent", "--daemon"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .stdin(Stdio::piped());
             let mut child = cmd.spawn().map_err(|e| {
                 emit_log(
                     app,
@@ -708,7 +748,10 @@ fn start_process_inner(
         }
         "gateway" => {
             let mut cmd = base_command(app);
-            cmd.args(["-u", "-m", "nanobot", "gateway"])
+            let entry = repo_root().join("nanobot").join("__main__.py");
+            cmd.arg("-u")
+            .arg(entry)
+            .arg("gateway")
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
             .stdin(Stdio::null());
