@@ -92,6 +92,26 @@ struct ConfigFilePayload {
 
 #[derive(Serialize, Clone)]
 #[serde(rename_all = "camelCase")]
+struct KnowledgeFileInfo {
+    name: String,
+    path: String,
+    relative_path: String,
+    is_dir: bool,
+    size: Option<u64>,
+    modified: Option<u64>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
+struct KnowledgeBasePayload {
+    directory: Option<String>,
+    configured: bool,
+    current_relative_path: String,
+    files: Vec<KnowledgeFileInfo>,
+}
+
+#[derive(Serialize, Clone)]
+#[serde(rename_all = "camelCase")]
 struct SessionMessagePayload {
     id: String,
     role: String,
@@ -186,6 +206,141 @@ fn read_config_workspace() -> Option<PathBuf> {
         .get("workspace")?
         .as_str()?;
     Some(expand_tilde(workspace))
+}
+
+fn read_config_value() -> Result<Value, String> {
+    let path = config_path();
+    if !path.exists() {
+        return Ok(json!({}));
+    }
+    let contents = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
+    let parsed: Value =
+        serde_json::from_str(&contents).map_err(|e| format!("Invalid JSON: {e}"))?;
+    if !parsed.is_object() {
+        return Err("Config must be a JSON object.".to_string());
+    }
+    Ok(parsed)
+}
+
+fn write_config_value(data: &Value) -> Result<(), String> {
+    if !data.is_object() {
+        return Err("Config must be a JSON object.".to_string());
+    }
+    let path = config_path();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
+    }
+    std::fs::write(
+        &path,
+        serde_json::to_string_pretty(data).map_err(|e| e.to_string())?,
+    )
+    .map_err(|e| e.to_string())?;
+    Ok(())
+}
+
+fn read_knowledge_base_dir() -> Option<PathBuf> {
+    let parsed = read_config_value().ok()?;
+    let raw = parsed.get("knowledgeBaseDir")?.as_str()?;
+    if raw.trim().is_empty() {
+        return None;
+    }
+    Some(expand_tilde(raw))
+}
+
+fn normalize_relative_path(path: Option<String>) -> Result<PathBuf, String> {
+    let raw = path.unwrap_or_default();
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Ok(PathBuf::new());
+    }
+    let candidate = PathBuf::from(trimmed);
+    let mut normalized = PathBuf::new();
+    for component in candidate.components() {
+        match component {
+            Component::Normal(part) => normalized.push(part),
+            Component::CurDir => {}
+            _ => return Err("Invalid knowledge base path.".to_string()),
+        }
+    }
+    Ok(normalized)
+}
+
+fn knowledge_base_payload(relative_path: Option<String>) -> Result<KnowledgeBasePayload, String> {
+    let Some(base_dir) = read_knowledge_base_dir() else {
+        return Ok(KnowledgeBasePayload {
+            directory: None,
+            configured: false,
+            current_relative_path: String::new(),
+            files: Vec::new(),
+        });
+    };
+    if !base_dir.exists() {
+        return Err(format!(
+            "Knowledge base directory does not exist: {}",
+            base_dir.display()
+        ));
+    }
+    if !base_dir.is_dir() {
+        return Err(format!(
+            "Knowledge base path is not a directory: {}",
+            base_dir.display()
+        ));
+    }
+    let current_relative = normalize_relative_path(relative_path)?;
+    let dir = if current_relative.as_os_str().is_empty() {
+        base_dir.clone()
+    } else {
+        base_dir.join(&current_relative)
+    };
+    if !dir.exists() {
+        return Err(format!("Directory does not exist: {}", dir.display()));
+    }
+    if !dir.is_dir() {
+        return Err(format!("Path is not a directory: {}", dir.display()));
+    }
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(&dir).map_err(|e| e.to_string())? {
+        let entry = entry.map_err(|e| e.to_string())?;
+        let path = entry.path();
+        let metadata = entry.metadata().ok();
+        let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let size = metadata
+            .as_ref()
+            .and_then(|m| if m.is_file() { Some(m.len()) } else { None });
+        let modified = metadata
+            .and_then(|m| m.modified().ok())
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs());
+        let name = path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .to_string();
+        let relative_path = if current_relative.as_os_str().is_empty() {
+            name.clone()
+        } else {
+            current_relative.join(&name).to_string_lossy().to_string()
+        };
+        files.push(KnowledgeFileInfo {
+            relative_path,
+            name,
+            path: path.to_string_lossy().to_string(),
+            is_dir,
+            size,
+            modified,
+        });
+    }
+    files.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    Ok(KnowledgeBasePayload {
+        directory: Some(base_dir.to_string_lossy().to_string()),
+        configured: true,
+        current_relative_path: current_relative.to_string_lossy().to_string(),
+        files,
+    })
 }
 
 fn resource_root_candidates(app: &AppHandle) -> Vec<PathBuf> {
@@ -1204,22 +1359,39 @@ fn save_memory_file(name: String, content: String) -> Result<(), String> {
 
 #[tauri::command]
 fn save_config_file(content: String) -> Result<(), String> {
-    let parsed: Value = serde_json::from_str(&content)
-        .map_err(|e| format!("Invalid JSON: {e}"))?;
-    if !parsed.is_object() {
-        return Err("Config must be a JSON object.".to_string());
-    }
-    let path = config_path();
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    }
-    std::fs::write(&path, content).map_err(|e| e.to_string())?;
-    Ok(())
+    let parsed: Value = serde_json::from_str(&content).map_err(|e| format!("Invalid JSON: {e}"))?;
+    write_config_value(&parsed)
 }
 
 #[tauri::command]
 fn run_onboard(app: AppHandle) -> Result<(), String> {
     run_onboard_inner(&app)
+}
+
+#[tauri::command]
+fn read_knowledge_base(relative_path: Option<String>) -> Result<KnowledgeBasePayload, String> {
+    knowledge_base_payload(relative_path)
+}
+
+#[tauri::command]
+fn set_knowledge_base_dir(path: String) -> Result<KnowledgeBasePayload, String> {
+    let dir = expand_tilde(path.trim());
+    if !dir.exists() {
+        return Err(format!("Directory does not exist: {}", dir.display()));
+    }
+    if !dir.is_dir() {
+        return Err(format!("Selected path is not a directory: {}", dir.display()));
+    }
+    let mut config = read_config_value()?;
+    let obj = config
+        .as_object_mut()
+        .ok_or_else(|| "Config must be a JSON object.".to_string())?;
+    obj.insert(
+        "knowledgeBaseDir".to_string(),
+        Value::String(dir.to_string_lossy().to_string()),
+    );
+    write_config_value(&config)?;
+    knowledge_base_payload(None)
 }
 
 #[tauri::command]
@@ -1423,6 +1595,7 @@ fn main() {
 
             Ok(())
         })
+        .plugin(tauri_plugin_dialog::init())
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
                 window.hide().ok();
@@ -1441,6 +1614,8 @@ fn main() {
             read_memory_file,
             save_memory_file,
             delete_memory_file,
+            read_knowledge_base,
+            set_knowledge_base_dir,
             read_config_file,
             save_config_file,
             run_onboard,

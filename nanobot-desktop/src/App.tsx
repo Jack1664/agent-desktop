@@ -1,10 +1,11 @@
 ﻿import { useEffect, useMemo, useRef, useState } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
+import { open } from "@tauri-apps/plugin-dialog";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 
-type TabKey = "chat" | "monitor" | "cron" | "sessions" | "skills" | "memory" | "config";
+type TabKey = "chat" | "monitor" | "cron" | "sessions" | "skills" | "memory" | "knowledge" | "config";
 
 type Message = {
   id: string;
@@ -61,6 +62,22 @@ type ConfigFilePayload = {
   path: string;
   content: string;
   exists: boolean;
+};
+
+type KnowledgeFileInfo = {
+  name: string;
+  path: string;
+  relativePath: string;
+  isDir: boolean;
+  size?: number;
+  modified?: number;
+};
+
+type KnowledgeBasePayload = {
+  directory: string | null;
+  configured: boolean;
+  currentRelativePath: string;
+  files: KnowledgeFileInfo[];
 };
 
 type CronData = {
@@ -331,11 +348,21 @@ export default function App() {
   const [configInitBusy, setConfigInitBusy] = useState(false);
   const [configInitError, setConfigInitError] = useState("");
   const [configImportName, setConfigImportName] = useState("");
+  const [knowledgeBase, setKnowledgeBase] = useState<KnowledgeBasePayload>({
+    directory: null,
+    configured: false,
+    files: []
+  });
+  const [knowledgeLoading, setKnowledgeLoading] = useState(false);
+  const [knowledgeError, setKnowledgeError] = useState("");
+  const [knowledgePicking, setKnowledgePicking] = useState(false);
+  const [knowledgePath, setKnowledgePath] = useState("");
   const configFileInputRef = useRef<HTMLInputElement | null>(null);
   const newSkillInputRef = useRef<HTMLInputElement | null>(null);
   const pendingLogsRef = useRef<LogState>({ agent: [], gateway: [] });
   const logFlushTimerRef = useRef<number | null>(null);
   const monitorActiveRef = useRef(false);
+  const knowledgePromptedRef = useRef(false);
 
   const normalizedNewSkillName = newSkillName.trim();
   const canCreateSkill =
@@ -619,6 +646,12 @@ export default function App() {
   useEffect(() => {
     if (tab === "config") {
       loadConfigFile();
+    }
+  }, [tab]);
+
+  useEffect(() => {
+    if (tab === "knowledge") {
+      loadKnowledgeBase(true);
     }
   }, [tab]);
 
@@ -990,6 +1023,82 @@ export default function App() {
       setConfigSaving(false);
     }
   };
+
+  const loadKnowledgeBase = async (promptIfMissing = false) => {
+    setKnowledgeLoading(true);
+    setKnowledgeError("");
+    try {
+      const payload = await invoke<KnowledgeBasePayload>("read_knowledge_base", {
+        relativePath: knowledgePath || null
+      });
+      setKnowledgeBase(payload);
+      setKnowledgePath(payload.currentRelativePath || "");
+      if (promptIfMissing && !payload.configured && !knowledgePromptedRef.current) {
+        knowledgePromptedRef.current = true;
+        await pickKnowledgeBaseDir();
+      }
+    } catch (err) {
+      setKnowledgeError(String(err));
+    } finally {
+      setKnowledgeLoading(false);
+    }
+  };
+
+  const pickKnowledgeBaseDir = async () => {
+    if (knowledgePicking) return;
+    setKnowledgePicking(true);
+    setKnowledgeError("");
+    try {
+      const selected = await open({
+        directory: true,
+        multiple: false,
+        title: "选择知识库存储目录"
+      });
+      if (!selected || Array.isArray(selected)) {
+        return;
+      }
+      const payload = await invoke<KnowledgeBasePayload>("set_knowledge_base_dir", {
+        path: selected
+      });
+      setKnowledgeBase(payload);
+      setKnowledgePath(payload.currentRelativePath || "");
+      if (configFile?.exists || tab === "config") {
+        await loadConfigFile();
+      }
+    } catch (err) {
+      setKnowledgeError(String(err));
+    } finally {
+      setKnowledgePicking(false);
+    }
+  };
+
+  const openKnowledgeFolder = async (relativePath: string) => {
+    setKnowledgePath(relativePath);
+    setKnowledgeLoading(true);
+    setKnowledgeError("");
+    try {
+      const payload = await invoke<KnowledgeBasePayload>("read_knowledge_base", {
+        relativePath
+      });
+      setKnowledgeBase(payload);
+      setKnowledgePath(payload.currentRelativePath || "");
+    } catch (err) {
+      setKnowledgeError(String(err));
+    } finally {
+      setKnowledgeLoading(false);
+    }
+  };
+
+  const openKnowledgeParent = async () => {
+    if (!knowledgeBase.currentRelativePath) return;
+    const parts = knowledgeBase.currentRelativePath.split(/[\\/]/).filter(Boolean);
+    parts.pop();
+    await openKnowledgeFolder(parts.join("/"));
+  };
+
+  const knowledgeCrumbs = knowledgeBase.currentRelativePath
+    ? knowledgeBase.currentRelativePath.split(/[\\/]/).filter(Boolean)
+    : [];
   const openMemory = async (name: string) => {
     try {
       const payload = await invoke<MemoryFilePayload>("read_memory_file", { name });
@@ -1164,6 +1273,12 @@ export default function App() {
             Memory
           </button>
           <button
+            className={tab === "knowledge" ? "active" : ""}
+            onClick={() => setTab("knowledge")}
+          >
+            Knowledge
+          </button>
+          <button
             className={tab === "config" ? "active" : ""}
             onClick={() => setTab("config")}
           >
@@ -1217,6 +1332,8 @@ export default function App() {
                     ? "Skills"
                     : tab === "memory"
                       ? "Memory"
+                      : tab === "knowledge"
+                        ? "Knowledge"
                       : "Config"}
           </h1>
           <div className="meta">Window close will hide to tray</div>
@@ -1813,6 +1930,138 @@ export default function App() {
                 )}
               </div>
             </div>
+          </div>
+        ) : tab === "knowledge" ? (
+          <div className="content">
+            <div className="memory-header">
+              <div>
+                Knowledge files: {knowledgeBase.files.length}
+              </div>
+              <div className="memory-actions">
+                <button onClick={() => void pickKnowledgeBaseDir()} disabled={knowledgePicking}>
+                  {knowledgeBase.configured ? "Change Directory" : "Choose Directory"}
+                </button>
+                <button onClick={() => void loadKnowledgeBase(false)} disabled={knowledgeLoading}>
+                  {knowledgeLoading ? "Refreshing..." : "Refresh"}
+                </button>
+              </div>
+            </div>
+            {knowledgeError && <div className="skills-error">{knowledgeError}</div>}
+            {!knowledgeBase.configured ? (
+              <div className="knowledge-empty-state">
+                <h3>选择知识库存储目录</h3>
+                <p>
+                  首次进入知识库管理时，需要先选择一个本地目录。选择后，应用会使用这个目录来展示和后续管理知识库文件。
+                </p>
+                <div className="modal-actions">
+                  <button onClick={() => void pickKnowledgeBaseDir()} disabled={knowledgePicking}>
+                    {knowledgePicking ? "Opening..." : "选择目录"}
+                  </button>
+                </div>
+              </div>
+            ) : (
+              <div className="memory-layout">
+                <div className="memory-list">
+                  <div className="skill-card">
+                    <div className="skill-title">当前目录</div>
+                    <div className="skill-path">{knowledgeBase.directory}</div>
+                    <div className="knowledge-breadcrumbs">
+                      <button
+                        className={!knowledgeBase.currentRelativePath ? "active" : ""}
+                        onClick={() => void openKnowledgeFolder("")}
+                      >
+                        Root
+                      </button>
+                      {knowledgeCrumbs.map((crumb, idx) => {
+                        const nextPath = knowledgeCrumbs.slice(0, idx + 1).join("/");
+                        return (
+                          <button
+                            key={nextPath}
+                            className={nextPath === knowledgeBase.currentRelativePath ? "active" : ""}
+                            onClick={() => void openKnowledgeFolder(nextPath)}
+                          >
+                            {crumb}
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+                  {knowledgeBase.currentRelativePath && (
+                    <button className="knowledge-up" onClick={() => void openKnowledgeParent()}>
+                      ← 返回上一级
+                    </button>
+                  )}
+                  {knowledgeBase.files.length === 0 && !knowledgeLoading && (
+                    <div className="skills-empty">当前目录中还没有文件。</div>
+                  )}
+                  {knowledgeBase.files.map((file) => (
+                    <div
+                      key={file.path}
+                      className={`memory-card knowledge-item ${file.isDir ? "dir" : "file"}`}
+                    >
+                      <div className="memory-top">
+                        <div className="memory-title">
+                          {file.isDir ? (
+                            <button
+                              className="knowledge-link"
+                              onClick={() => void openKnowledgeFolder(file.relativePath)}
+                            >
+                              <span className="knowledge-link-icon">📁</span>
+                              <span>{file.name}</span>
+                              <span className="knowledge-link-arrow">进入</span>
+                            </button>
+                          ) : (
+                            <span className="knowledge-file-name">
+                              <span className="knowledge-link-icon">📄</span>
+                              <span>{file.name}</span>
+                            </span>
+                          )}
+                        </div>
+                        <span className={`knowledge-badge ${file.isDir ? "dir" : "file"}`}>
+                          {file.isDir ? "DIR" : "FILE"}
+                        </span>
+                      </div>
+                      <div className="skill-path">{file.path}</div>
+                      <div className="skill-meta">
+                        {file.isDir ? "Directory" : `Size: ${(file.size || 0).toLocaleString()} bytes`}
+                      </div>
+                      {file.modified ? (
+                        <div className="skill-meta">
+                          Updated: {new Date(file.modified * 1000).toLocaleString()}
+                        </div>
+                      ) : null}
+                    </div>
+                  ))}
+                </div>
+                <div className="memory-editor">
+                  <div className="editor-header">
+                    <div className="editor-title">知识库说明</div>
+                    <div className="editor-actions">
+                      <button className="ghost" onClick={() => void pickKnowledgeBaseDir()} disabled={knowledgePicking}>
+                        更换目录
+                      </button>
+                    </div>
+                  </div>
+                  <div className="knowledge-summary">
+                    <div className="knowledge-stat">
+                      <span>已授权目录</span>
+                      <strong>{knowledgeBase.directory}</strong>
+                    </div>
+                    <div className="knowledge-stat">
+                      <span>条目数量</span>
+                      <strong>{knowledgeBase.files.length}</strong>
+                    </div>
+                    <div className="knowledge-stat">
+                      <span>当前子路径</span>
+                      <strong>{knowledgeBase.currentRelativePath || "/"}</strong>
+                    </div>
+                    <div className="editor-hint">
+                      点击目录名称可以继续进入子目录浏览。后续如果你要，我可以继续补充文件预览、新建、删除和重命名能力。
+                    </div>
+                  </div>
+                </div>
+              </div>
+            )}
           </div>
         ) : (
           <div className="content">
